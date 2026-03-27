@@ -1,7 +1,7 @@
 {
-  "name": "@tobilu/qmd",
-  "version": "2.0.1",
-  "description": "Query Markup Documents - On-device hybrid search for markdown files with BM25, vector search, and LLM reranking",
+  "name": "@icelantis/qmd-simple",
+  "version": "2.0.1-simple.1",
+  "description": "QMD fork with improved Chinese search using SQLite FTS5 simple tokenizer and jieba-based query rewriting",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
