@@ -34,10 +34,11 @@ build_image() {
 
   # Copy project files into build context so vitest/bun tests can run inside
   rm -rf test/test-src
-  mkdir -p test/test-src/src test/test-src/test
+  mkdir -p test/test-src/src test/test-src/test test/test-src/vendor
   cp src/*.ts test/test-src/src/
   cp -r dist test/test-src/
   cp test/*.test.ts test/test-src/test/
+  cp -r vendor/* test/test-src/vendor/
   cp package.json tsconfig.json tsconfig.build.json test/test-src/
 
   echo "==> Building container image ($CTR)..."
@@ -108,6 +109,21 @@ run_smoke_tests() {
       if (!r.v) process.exit(1);
     \""
 
+  smoke_test "simple extension loads (node package)" \
+    "export PATH=$NODE_BIN:\$PATH;
+     NPM_GLOBAL=\$(npm root -g);
+     node -e \"
+      const {openDatabase, loadSimpleExtension, ensureJiebaInitialized} = await import('\$NPM_GLOBAL/@tobilu/qmd/dist/db.js');
+      const db = openDatabase(':memory:');
+      loadSimpleExtension(db);
+      ensureJiebaInitialized(db);
+      db.exec(\\\"CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='porter simple')\\\");
+      db.prepare(\\\"INSERT INTO docs(body) VALUES (?)\\\").run('人工智能技术发展');
+      const row = db.prepare(\\\"SELECT count(*) as c FROM docs WHERE docs MATCH jieba_query(?)\\\").get('rengong zhineng');
+      console.log('simple', row.c);
+      if (row.c !== 1) process.exit(1);
+    \""
+
   smoke_test "vitest (node)" \
     "export PATH=$NODE_BIN:\$PATH; cd /opt/qmd && npx vitest run --reporter=verbose test/store.test.ts 2>&1 | tail -5"
 
@@ -135,6 +151,19 @@ run_smoke_tests() {
       const r = db.prepare('SELECT vec_version() as v').get();
       console.log('sqlite-vec', r.v);
       if (!r.v) process.exit(1);
+    \""
+
+  smoke_test "simple extension loads (bun package)" \
+    "export PATH=$BUN_BIN:\$PATH; bun -e \"
+      const {openDatabase, loadSimpleExtension, ensureJiebaInitialized} = await import('\$HOME/.bun/install/global/node_modules/@tobilu/qmd/dist/db.js');
+      const db = openDatabase(':memory:');
+      loadSimpleExtension(db);
+      ensureJiebaInitialized(db);
+      db.exec(\\\"CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='porter simple')\\\");
+      db.prepare(\\\"INSERT INTO docs(body) VALUES (?)\\\").run('人工智能技术发展');
+      const row = db.prepare(\\\"SELECT count(*) as c FROM docs WHERE docs MATCH jieba_query(?)\\\").get('rengong zhineng');
+      console.log('simple', row.c);
+      if (row.c !== 1) process.exit(1);
     \""
 
   smoke_test "bun test store" \

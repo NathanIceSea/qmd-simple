@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { openDatabase, loadSqliteVec } from "../src/db.js";
+import { openDatabase, loadSimpleExtension, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -34,6 +34,7 @@ afterAll(async () => {
 });
 
 function initTestDatabase(db: Database): void {
+  loadSimpleExtension(db);
   loadSqliteVec(db);
   db.exec("PRAGMA journal_mode = WAL");
 
@@ -87,19 +88,34 @@ function initTestDatabase(db: Database): void {
 
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      name, body,
-      content='documents',
-      content_rowid='id',
-      tokenize='porter unicode61'
+      filepath, title, body,
+      tokenize='porter simple'
     )
   `);
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-      INSERT INTO documents_fts(rowid, name, body)
-      SELECT new.id, new.path, content.doc
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT new.id, new.collection || '/' || new.path, new.title, content.doc
       FROM content
       WHERE content.hash = new.hash;
+    END
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id;
+    END
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      SELECT new.id, new.collection || '/' || new.path, new.title, content.doc
+      FROM content
+      WHERE content.hash = new.hash AND new.active = 1;
     END
   `);
 

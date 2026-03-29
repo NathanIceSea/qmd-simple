@@ -472,7 +472,50 @@ describe("Store Creation", () => {
     expect(tableNames).toContain("llm_cache");
     // Note: path_contexts table removed in favor of YAML-based context storage
 
+    const ftsTable = store.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type='table' AND name='documents_fts'
+    `).get() as { sql: string };
+    expect(ftsTable.sql).toContain(`tokenize='porter simple'`);
+
     await cleanupTestDb(store);
+  });
+
+  test("createStore migrates legacy porter/unicode61 FTS tables to porter simple", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ name: "legacy" });
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "anthem",
+      title: "中华人民共和国国歌",
+      body: "中华人民共和国国歌是义勇军进行曲。",
+      displayPath: "history/anthem.md",
+    });
+
+    store.db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+    store.db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+    store.db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+    store.db.exec(`DROP TABLE IF EXISTS documents_fts`);
+    store.db.exec(`
+      CREATE VIRTUAL TABLE documents_fts USING fts5(
+        filepath, title, body,
+        tokenize='porter unicode61'
+      )
+    `);
+    store.close();
+
+    const reopened = createStore(store.dbPath);
+    currentTestStore = reopened;
+
+    const ftsTable = reopened.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type='table' AND name='documents_fts'
+    `).get() as { sql: string };
+    expect(ftsTable.sql).toContain(`tokenize='porter simple'`);
+
+    const results = reopened.searchFTS("中华人民共和国国歌", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/history/anthem.md`);
+
+    await cleanupTestDb(reopened);
   });
 
   test("createStore sets WAL journal mode", async () => {
@@ -1262,6 +1305,102 @@ describe("FTS Search", () => {
     const results = store.searchFTS("foo(bar)", 10);
     // Results may vary based on FTS5 handling
     expect(Array.isArray(results)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS finds Chinese documents with jieba query rewriting", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "anthem",
+      title: "中华人民共和国国歌",
+      body: "中华人民共和国国歌是义勇军进行曲，常用于国家仪式。",
+      displayPath: "cn/anthem.md",
+    });
+
+    const results = store.searchFTS("中华人民共和国国歌", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/cn/anthem.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS supports pinyin lookup through simple tokenizer", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "ai",
+      title: "人工智能技术发展",
+      body: "深度学习和自然语言处理是人工智能的核心技术。",
+      displayPath: "cn/ai.md",
+    });
+
+    const results = store.searchFTS("rengong zhineng", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/cn/ai.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS handles mixed Chinese and English terms", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "mix",
+      title: "AI 技术概览",
+      body: "AI 技术正在改变软件开发和搜索系统。",
+      displayPath: "mixed/ai-tech.md",
+    });
+
+    const results = store.searchFTS("AI 技术", 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/mixed/ai-tech.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS preserves phrase and negation syntax with simple-backed lex queries", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "handbook",
+      title: "Machine Learning Handbook",
+      body: "A practical machine learning handbook for search relevance.",
+      displayPath: "ml/handbook.md",
+    });
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "sports",
+      title: "Sports Machine Learning Notes",
+      body: "Sports analytics machine learning examples.",
+      displayPath: "ml/sports.md",
+    });
+
+    const phraseResults = store.searchFTS('"machine learning"', 10);
+    expect(phraseResults.length).toBe(2);
+
+    const negatedResults = store.searchFTS('"machine learning" -sports', 10);
+    expect(negatedResults).toHaveLength(1);
+    expect(negatedResults[0]!.displayPath).toBe(`${collectionName}/ml/handbook.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("sanitizeFTS5Term handles tokenizer-relevant punctuation like C++", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "cpp",
+      title: "C++ Performance Guide",
+      body: "C++ performance tuning tips for systems code.",
+      displayPath: "cpp/perf.md",
+    });
+
+    const results = store.searchFTS('"C++ performance"', 10);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/cpp/perf.md`);
 
     await cleanupTestDb(store);
   });

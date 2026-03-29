@@ -11,7 +11,12 @@
  *   const store = createStore();
  */
 
-import { openDatabase, loadSqliteVec } from "./db.js";
+import {
+  ensureJiebaInitialized,
+  loadSimpleExtension,
+  loadSqliteVec,
+  openDatabase,
+} from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -259,13 +264,13 @@ export function homedir(): string {
  * - Unix paths: /path/to/file
  * - Windows native: C:\path or C:/path
  * - Git Bash: /c/path or /C/path (C-Z drives, excluding A/B floppy drives)
- * 
+ *
  * Note: /c without trailing slash is treated as Unix path (directory named "c"),
  * while /c/ or /c/path are treated as Git Bash paths (C: drive).
  */
 export function isAbsolutePath(path: string): boolean {
   if (!path) return false;
-  
+
   // Unix absolute path
   if (path.startsWith('/')) {
     // Check if it's a Git Bash style path like /c/ or /c/Users (C-Z only, not A or B)
@@ -279,12 +284,12 @@ export function isAbsolutePath(path: string): boolean {
     // Any other path starting with / is Unix absolute
     return true;
   }
-  
+
   // Windows native path: C:\ or C:/ (any letter A-Z)
   if (path.length >= 2 && /[a-zA-Z]/.test(path[0]!) && path[1] === ':') {
     return true;
   }
-  
+
   return false;
 }
 
@@ -306,25 +311,25 @@ export function getRelativePathFromPrefix(path: string, prefix: string): string 
   if (!prefix) {
     return null;
   }
-  
+
   const normalizedPath = normalizePathSeparators(path);
   const normalizedPrefix = normalizePathSeparators(prefix);
-  
+
   // Ensure prefix ends with / for proper matching
-  const prefixWithSlash = !normalizedPrefix.endsWith('/') 
-    ? normalizedPrefix + '/' 
+  const prefixWithSlash = !normalizedPrefix.endsWith('/')
+    ? normalizedPrefix + '/'
     : normalizedPrefix;
-  
+
   // Exact match
   if (normalizedPath === normalizedPrefix) {
     return '';
   }
-  
+
   // Check if path starts with prefix
   if (normalizedPath.startsWith(prefixWithSlash)) {
     return normalizedPath.slice(prefixWithSlash.length);
   }
-  
+
   return null;
 }
 
@@ -332,18 +337,18 @@ export function resolve(...paths: string[]): string {
   if (paths.length === 0) {
     throw new Error("resolve: at least one path segment is required");
   }
-  
+
   // Normalize all paths to use forward slashes
   const normalizedPaths = paths.map(normalizePathSeparators);
-  
+
   let result = '';
   let windowsDrive = '';
-  
+
   // Check if first path is absolute
   const firstPath = normalizedPaths[0]!;
   if (isAbsolutePath(firstPath)) {
     result = firstPath;
-    
+
     // Extract Windows drive letter if present
     if (firstPath.length >= 2 && /[a-zA-Z]/.test(firstPath[0]!) && firstPath[1] === ':') {
       windowsDrive = firstPath.slice(0, 2);
@@ -359,7 +364,7 @@ export function resolve(...paths: string[]): string {
   } else {
     // Start with PWD or cwd, then append the first relative path
     const pwd = normalizePathSeparators(process.env.PWD || process.cwd());
-    
+
     // Extract Windows drive from PWD if present
     if (pwd.length >= 2 && /[a-zA-Z]/.test(pwd[0]!) && pwd[1] === ':') {
       windowsDrive = pwd.slice(0, 2);
@@ -368,14 +373,14 @@ export function resolve(...paths: string[]): string {
       result = pwd + '/' + firstPath;
     }
   }
-  
+
   // Process remaining paths
   for (let i = 1; i < normalizedPaths.length; i++) {
     const p = normalizedPaths[i]!;
     if (isAbsolutePath(p)) {
       // Absolute path replaces everything
       result = p;
-      
+
       // Update Windows drive if present
       if (p.length >= 2 && /[a-zA-Z]/.test(p[0]!) && p[1] === ':') {
         windowsDrive = p.slice(0, 2);
@@ -397,7 +402,7 @@ export function resolve(...paths: string[]): string {
       result = result + '/' + p;
     }
   }
-  
+
   // Normalize . and .. components
   const parts = result.split('/').filter(Boolean);
   const normalized: string[] = [];
@@ -408,15 +413,15 @@ export function resolve(...paths: string[]): string {
       normalized.push(part);
     }
   }
-  
+
   // Build final path
   const finalPath = '/' + normalized.join('/');
-  
+
   // Prepend Windows drive if present
   if (windowsDrive) {
     return windowsDrive + finalPath;
   }
-  
+
   return finalPath;
 }
 
@@ -625,8 +630,105 @@ export function verifySqliteVecLoaded(db: Database): void {
 }
 
 let _sqliteVecAvailable: boolean | null = null;
+const DOCUMENTS_FTS_TOKENIZER = "porter simple";
+
+function createDocumentsFtsTable(db: Database): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+      filepath, title, body,
+      tokenize='${DOCUMENTS_FTS_TOKENIZER}'
+    )
+  `);
+}
+
+function createDocumentsFtsTriggers(db: Database): void {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
+    WHEN new.active = 1
+    BEGIN
+      INSERT INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+      DELETE FROM documents_fts WHERE rowid = old.id;
+    END
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+    BEGIN
+      -- Delete from FTS if no longer active
+      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
+
+      -- Update FTS if still/newly active
+      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
+      SELECT
+        new.id,
+        new.collection || '/' || new.path,
+        new.title,
+        (SELECT doc FROM content WHERE hash = new.hash)
+      WHERE new.active = 1;
+    END
+  `);
+}
+
+function dropDocumentsFtsTable(db: Database): void {
+  db.exec(`DROP TABLE IF EXISTS documents_fts`);
+}
+
+function dropDocumentsFtsTriggers(db: Database): void {
+  db.exec(`DROP TRIGGER IF EXISTS documents_ai`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_ad`);
+  db.exec(`DROP TRIGGER IF EXISTS documents_au`);
+}
+
+function rebuildDocumentsFts(db: Database): void {
+  dropDocumentsFtsTable(db);
+  dropDocumentsFtsTriggers(db);
+  createDocumentsFtsTable(db);
+  createDocumentsFtsTriggers(db);
+  db.exec(`
+    INSERT INTO documents_fts(rowid, filepath, title, body)
+    SELECT
+      d.id,
+      d.collection || '/' || d.path,
+      d.title,
+      c.doc
+    FROM documents d
+    JOIN content c ON c.hash = d.hash
+    WHERE d.active = 1
+  `);
+}
+
+function ensureDocumentsFtsSchema(db: Database): void {
+  const row = db.prepare(`
+    SELECT sql
+    FROM sqlite_master
+    WHERE type = 'table' AND name = 'documents_fts'
+  `).get() as { sql: string | null } | null;
+
+  const usesConfiguredTokenizer = !!row?.sql
+    && new RegExp(`tokenize\\s*=\\s*'${DOCUMENTS_FTS_TOKENIZER.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}'`).test(row.sql);
+  if (!usesConfiguredTokenizer) {
+    rebuildDocumentsFts(db);
+    return;
+  }
+
+  createDocumentsFtsTable(db);
+  createDocumentsFtsTriggers(db);
+}
 
 function initializeDatabase(db: Database): void {
+  loadSimpleExtension(db);
+
   try {
     loadSqliteVec(db);
     verifySqliteVecLoaded(db);
@@ -720,51 +822,7 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
-  // FTS - index filepath (collection/path), title, and content
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      filepath, title, body,
-      tokenize='porter unicode61'
-    )
-  `);
-
-  // Triggers to keep FTS in sync
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
-    WHEN new.active = 1
-    BEGIN
-      INSERT INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
-
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-      DELETE FROM documents_fts WHERE rowid = old.id;
-    END
-  `);
-
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
-    BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-
-      -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-      SELECT
-        new.id,
-        new.collection || '/' || new.path,
-        new.title,
-        (SELECT doc FROM content WHERE hash = new.hash)
-      WHERE new.active = 1;
-    END
-  `);
+  ensureDocumentsFtsSchema(db);
 }
 
 // =============================================================================
@@ -2505,8 +2563,16 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // FTS Search
 // =============================================================================
 
-function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+export function sanitizeFTS5Term(term: string): string | null {
+  // Escape embedded quotes just in case a caller passes raw phrase content through.
+  const sanitized = term.replace(/"/g, '""');
+  return sanitized ? sanitized : null;
+}
+
+export function compileJiebaTerm(db: Database, term: string): string | null {
+  const row = db.prepare(`SELECT jieba_query(?) AS query`).get(term) as { query?: string | null } | null;
+  const compiled = row?.query?.trim();
+  return compiled ? `(${compiled})` : null;
 }
 
 /**
@@ -2515,16 +2581,21 @@ function sanitizeFTS5Term(term: string): string {
  * Supports:
  * - Quoted phrases: "exact phrase" → "exact phrase" (exact match)
  * - Negation: -term or -"phrase" → uses FTS5 NOT operator
- * - Plain terms: term → "term"* (prefix match)
+ * - Plain terms: term → jieba_query("term") (jieba_query build match)
  *
  * FTS5 NOT is a binary operator: `term1 NOT term2` means "match term1 but not term2".
  * So `-term` only works when there are also positive terms.
  *
+ * jieba_query returns a complete expression representing best effort to match a single phrase solely, the resulting expression must be parenthesized:
+ *   SELECT jieba_query("Rust生命周期");  → ( r+u+s+t* OR rust* ) AND "生命周期"
+ *
  * Examples:
- *   performance -sports     → "performance"* NOT "sports"*
+ *   performance -sports     → (( p+e+r+f+o+r+m+a+n+c+e* OR performance* )) NOT (( s+p+o+r+t+s* OR sports* ))
  *   "machine learning"      → "machine learning"
  */
-function buildFTS5Query(query: string): string | null {
+export function buildFTS5Query(db: Database, query: string): string | null {
+  ensureJiebaInitialized(db);
+
   const positive: string[] = [];
   const negative: string[] = [];
 
@@ -2548,7 +2619,7 @@ function buildFTS5Query(query: string): string | null {
       const phrase = s.slice(start, i).trim();
       i++; // skip closing quote
       if (phrase.length > 0) {
-        const sanitized = phrase.split(/\s+/).map(t => sanitizeFTS5Term(t)).filter(t => t).join(' ');
+        const sanitized = sanitizeFTS5Term(phrase);
         if (sanitized) {
           const ftsPhrase = `"${sanitized}"`;  // Exact phrase, no prefix match
           if (negated) {
@@ -2564,9 +2635,8 @@ function buildFTS5Query(query: string): string | null {
       while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
       const term = s.slice(start, i);
 
-      const sanitized = sanitizeFTS5Term(term);
-      if (sanitized) {
-        const ftsTerm = `"${sanitized}"*`;  // Prefix match
+      const ftsTerm = compileJiebaTerm(db, term);
+      if (ftsTerm) {
         if (negated) {
           negative.push(ftsTerm);
         } else {
@@ -2616,7 +2686,7 @@ export function validateLexQuery(query: string): string | null {
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
-  const ftsQuery = buildFTS5Query(query);
+  const ftsQuery = buildFTS5Query(db, query);
   if (!ftsQuery) return [];
 
   let sql = `

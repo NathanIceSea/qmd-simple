@@ -14,13 +14,18 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildFTS5Query as _buildFTS5Query,
   createStore,
+  compileJiebaTerm,
+  sanitizeFTS5Term,
   structuredSearch,
   validateSemanticQuery,
   validateLexQuery,
   type ExpandedQuery,
   type Store,
 } from "../src/store.js";
+import { openDatabase } from "../src/db.js";
+import type { Database } from "../src/db.js";
 import { disposeDefaultLlamaCpp } from "../src/llm.js";
 
 // =============================================================================
@@ -394,86 +399,73 @@ describe("lex query syntax", () => {
 // =============================================================================
 
 describe("buildFTS5Query (lex parser)", () => {
-  // Mirror the function for unit testing
-  function sanitizeFTS5Term(term: string): string {
-    return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+  let db: Database;
+
+  function compiledTerm(term: string): string {
+    return compileJiebaTerm(db, term)!;
+  }
+
+  function exactPhrase(phrase: string): string {
+    return `"${sanitizeFTS5Term(phrase)!}"`;
   }
 
   function buildFTS5Query(query: string): string | null {
-    const positive: string[] = [];
-    const negative: string[] = [];
-    let i = 0;
-    const s = query.trim();
-
-    while (i < s.length) {
-      while (i < s.length && /\s/.test(s[i]!)) i++;
-      if (i >= s.length) break;
-      const negated = s[i] === '-';
-      if (negated) i++;
-
-      if (s[i] === '"') {
-        const start = i + 1; i++;
-        while (i < s.length && s[i] !== '"') i++;
-        const phrase = s.slice(start, i).trim();
-        i++;
-        if (phrase.length > 0) {
-          const sanitized = phrase.split(/\s+/).map((t: string) => sanitizeFTS5Term(t)).filter((t: string) => t).join(' ');
-          if (sanitized) (negated ? negative : positive).push(`"${sanitized}"`);
-        }
-      } else {
-        const start = i;
-        while (i < s.length && !/[\s"]/.test(s[i]!)) i++;
-        const term = s.slice(start, i);
-        const sanitized = sanitizeFTS5Term(term);
-        if (sanitized) (negated ? negative : positive).push(`"${sanitized}"*`);
-      }
-    }
-
-    if (positive.length === 0 && negative.length === 0) return null;
-    if (positive.length === 0) return null;
-
-    let result = positive.join(' AND ');
-    for (const neg of negative) result = `${result} NOT ${neg}`;
-    return result;
+    return _buildFTS5Query(db, query);
   }
 
+  beforeAll(() => {
+    db = openDatabase(":memory:");
+  });
+
+  afterAll(() => {
+    db.close();
+  });
+
   test("plain terms → prefix match with AND", () => {
-    expect(buildFTS5Query("foo bar")).toBe('"foo"* AND "bar"*');
+    expect(buildFTS5Query("foo bar")).toBe(`${compiledTerm("foo")} AND ${compiledTerm("bar")}`);
   });
 
   test("single term", () => {
-    expect(buildFTS5Query("performance")).toBe('"performance"*');
+    expect(buildFTS5Query("performance")).toBe(compiledTerm("performance"));
   });
 
   test("quoted phrase → exact match (no prefix)", () => {
-    expect(buildFTS5Query('"machine learning"')).toBe('"machine learning"');
+    expect(buildFTS5Query('"machine learning"')).toBe(exactPhrase("machine learning"));
   });
 
-  test("quoted phrase with mixed case sanitized", () => {
-    expect(buildFTS5Query('"C++ performance"')).toBe('"c performance"');
+  test("quoted phrase preserves tokenizer-relevant characters", () => {
+    expect(buildFTS5Query('"C++ performance"')).toBe(exactPhrase("C++ performance"));
   });
 
   test("negation of term", () => {
-    expect(buildFTS5Query("performance -sports")).toBe('"performance"* NOT "sports"*');
+    expect(buildFTS5Query("performance -sports")).toBe(
+      `${compiledTerm("performance")} NOT ${compiledTerm("sports")}`
+    );
   });
 
   test("negation of phrase", () => {
-    expect(buildFTS5Query('performance -"sports athlete"')).toBe('"performance"* NOT "sports athlete"');
+    expect(buildFTS5Query('performance -"sports athlete"')).toBe(
+      `${compiledTerm("performance")} NOT ${exactPhrase("sports athlete")}`
+    );
   });
 
   test("multiple negations", () => {
-    expect(buildFTS5Query("performance -sports -athlete")).toBe('"performance"* NOT "sports"* NOT "athlete"*');
+    expect(buildFTS5Query("performance -sports -athlete")).toBe(
+      `${compiledTerm("performance")} NOT ${compiledTerm("sports")} NOT ${compiledTerm("athlete")}`
+    );
   });
 
   test("quoted positive + negation", () => {
-    expect(buildFTS5Query('"machine learning" -sports -athlete')).toBe('"machine learning" NOT "sports"* NOT "athlete"*');
+    expect(buildFTS5Query('"machine learning" -sports -athlete')).toBe(
+      `${exactPhrase("machine learning")} NOT ${compiledTerm("sports")} NOT ${compiledTerm("athlete")}`
+    );
   });
 
   test("intent-aware C++ performance example", () => {
     const result = buildFTS5Query('"C++ performance" optimization -sports -athlete');
-    expect(result).toContain('NOT "sports"*');
-    expect(result).toContain('NOT "athlete"*');
-    expect(result).toContain('"optimization"*');
+    expect(result).toContain(`NOT ${compiledTerm("sports")}`);
+    expect(result).toContain(`NOT ${compiledTerm("athlete")}`);
+    expect(result).toContain(compiledTerm("optimization"));
   });
 
   test("only negations with no positives → null (can't search)", () => {
@@ -485,7 +477,12 @@ describe("buildFTS5Query (lex parser)", () => {
     expect(buildFTS5Query("   ")).toBeNull();
   });
 
-  test("special chars in terms stripped", () => {
-    expect(buildFTS5Query("hello!world")).toBe('"helloworld"*');
+  test("special chars in terms are delegated to jieba_query", () => {
+    expect(buildFTS5Query("hello!world")).toBe(compiledTerm("hello!world"));
+  });
+
+  test("examples identical result", () => {
+    expect(buildFTS5Query('performance -sports')).toBe(`(( p+e+r+f+o+r+m+a+n+c+e* OR performance* )) NOT (( s+p+o+r+t+s* OR sports* ))`);
+    expect(buildFTS5Query('"machine learning"')).toBe(`"machine learning"`);
   });
 });
