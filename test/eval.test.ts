@@ -35,8 +35,8 @@ import {
   reciprocalRankFusion,
   DEFAULT_EMBED_MODEL,
   type RankedResult,
-} from "../src/store";
-import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm";
+} from "../src/store.js";
+import { getDefaultLlamaCpp, formatDocForEmbedding, disposeDefaultLlamaCpp } from "../src/llm.js";
 
 // Eval queries with expected documents
 const evalQueries: {
@@ -78,9 +78,62 @@ const evalQueries: {
   { query: "CI/CD pipeline testing coverage", expectedDoc: "product-launch", difficulty: "fusion" },
 ];
 
+const chineseEvalQueries: {
+  query: string;
+  expectedDocs: string[];
+  topK: number;
+  unexpectedDocs?: string[];
+  unexpectedTopK?: number;
+  purpose: string;
+}[] = [
+  {
+    query: "中华人民共和国国歌",
+    expectedDocs: [
+      "法律-中华人民共和国国歌",
+      "历史-义勇军进行曲的历史",
+    ],
+    topK: 3,
+    purpose: "预期：标题或正文完整包含该短语的文档应最靠前",
+  },
+  {
+    query: "国家 仪式 国歌",
+    expectedDocs: [
+      "社会-国家仪式与礼仪",
+      "音乐-国歌的历史与演变",
+      "法律-中华人民共和国国歌",
+    ],
+    topK: 5,
+    unexpectedDocs: [
+      "社会-学校升旗仪式",
+    ],
+    unexpectedTopK: 5,
+    purpose: "预期：国家仪式与礼仪 / 国歌的历史与演变 / 中华人民共和国国歌 等靠前",
+  },
+  {
+    query: "QMD 记忆 搜索",
+    expectedDocs: ["科技-QMD-记忆搜索系统"],
+    topK: 1,
+    purpose: "预期：QMD 记忆搜索系统 应最靠前，其他搜索相关文档其次",
+  },
+  {
+    query: "Rust 生命周期",
+    expectedDocs: ["科技-Rust-生命周期"],
+    topK: 1,
+    unexpectedDocs: [
+      "科技-中文全文检索系统",
+      "科技-BM25-排序算法简介",
+      "科技-Jieba-中文分词",
+      "科技-记忆搜索中的中文查询",
+      "科技-相关性评分与排序",
+    ],
+    unexpectedTopK: 3,
+    purpose: "预期：Rust 生命周期 相关文档靠前，中文搜索/BM25文档不应误排到前列",
+  },
+];
+
 // Helper to check if result matches expected doc
 function matchesExpected(filepath: string, expectedDoc: string): boolean {
-  return filepath.toLowerCase().includes(expectedDoc);
+  return filepath.toLowerCase().includes(expectedDoc.toLowerCase());
 }
 
 // Helper to calculate hit rate
@@ -97,6 +150,59 @@ function calcHitRate(
   return hits / queries.length;
 }
 
+function extractEvalTitle(content: string, fallback: string): string {
+  const subtitle = content.match(/^##\s+(.+)$/m)?.[1]?.trim();
+  if (subtitle) return subtitle;
+
+  const heading = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  if (heading) return heading;
+
+  return fallback;
+}
+
+function indexEvalDocs(db: Database, dirName: string, collectionName: string): void {
+  const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), dirName);
+  const files = readdirSync(evalDocsDir).filter((f) => f.endsWith(".md"));
+
+  for (const file of files) {
+    const content = readFileSync(join(evalDocsDir, file), "utf-8");
+    const title = extractEvalTitle(content, file);
+    const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
+    const now = new Date().toISOString();
+
+    insertContent(db, hash, content, now);
+    insertDocument(db, collectionName, file, title, hash, now, now);
+  }
+}
+
+function expectChineseEvalMatch(
+  results: Array<{ filepath?: string; file?: string }>,
+  query: string,
+  purpose: string,
+  expectedDocs: string[],
+  topK: number,
+  unexpectedDocs: string[] = [],
+  unexpectedTopK?: number,
+): void {
+  const topResults = results.slice(0, topK);
+  for (const expectedDoc of expectedDocs) {
+    expect(
+      topResults.some((r) => matchesExpected(r.filepath ?? r.file ?? "", expectedDoc)),
+      `${query}: ${purpose}; missing ${expectedDoc} in top${topK}`,
+    ).toBe(true);
+  }
+
+  if (unexpectedDocs.length > 0) {
+    const forbiddenResults = results.slice(0, unexpectedTopK ?? topK);
+    for (const unexpectedDoc of unexpectedDocs) {
+      expect(
+        forbiddenResults.some((r) => matchesExpected(r.filepath ?? r.file ?? "", unexpectedDoc)),
+        `${query}: ${purpose}; unexpected ${unexpectedDoc} appeared in top${unexpectedTopK ?? topK}`,
+      ).toBe(false);
+    }
+  }
+}
+
 // =============================================================================
 // BM25 (Lexical) Tests - Fast, no model loading needed
 // =============================================================================
@@ -109,19 +215,8 @@ describe("BM25 Search (FTS)", () => {
     store = createStore();
     db = store.db;
 
-    // Load and index eval documents
-    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
-    const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
-
-    for (const file of files) {
-      const content = readFileSync(join(evalDocsDir, file), "utf-8");
-      const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
-      const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
-      const now = new Date().toISOString();
-
-      insertContent(db, hash, content, now);
-      insertDocument(db, "eval-docs", file, title, hash, now, now);
-    }
+    indexEvalDocs(db, "eval-docs", "eval-docs");
+    indexEvalDocs(db, "eval-docs-cn", "eval-docs-cn");
   });
 
   afterAll(() => {
@@ -149,6 +244,11 @@ describe("BM25 Search (FTS)", () => {
   test("overall Hit@3 ≥40% (BM25 baseline)", () => {
     const hitRate = calcHitRate(evalQueries, q => searchFTS(db, q, 5), 3);
     expect(hitRate).toBeGreaterThanOrEqual(0.4);
+  });
+
+  test.each(chineseEvalQueries)("Chinese BM25: $query", ({ query, expectedDocs, topK, unexpectedDocs, unexpectedTopK, purpose }) => {
+    const results = searchFTS(db, query, 5);
+    expectChineseEvalMatch(results, query, purpose, expectedDocs, topK, unexpectedDocs, unexpectedTopK);
   });
 });
 
@@ -182,11 +282,16 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
     const llm = getDefaultLlamaCpp();
     store.ensureVecTable(768); // embeddinggemma uses 768 dimensions
 
-    const evalDocsDir = join(dirname(fileURLToPath(import.meta.url)), "eval-docs");
-    const files = readdirSync(evalDocsDir).filter(f => f.endsWith(".md"));
+    const currDir = dirname(fileURLToPath(import.meta.url));
+    const evalDocsDir = join(currDir, "eval-docs");
+    const evalDocsCnDir = join(currDir, "eval-docs-cn");
+    const files = [
+      ...readdirSync(evalDocsDir).filter(f => f.endsWith(".md")).map(f => join("eval-docs", f)),
+      ...readdirSync(evalDocsCnDir).filter(f => f.endsWith(".md")).map(f => join("eval-docs-cn", f)),
+    ];
 
     for (const file of files) {
-      const content = readFileSync(join(evalDocsDir, file), "utf-8");
+      const content = readFileSync(join(currDir, file), "utf-8");
       const hash = createHash("sha256").update(content).digest("hex").slice(0, 12);
       const title = content.split("\n")[0]?.replace(/^#\s*/, "") || file;
 
@@ -261,6 +366,13 @@ describe.skipIf(!!process.env.CI)("Vector Search", () => {
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
+  }, 60000);
+
+  test.each(chineseEvalQueries)("Chinese Vector: $query", async ({ query, expectedDocs, topK, unexpectedDocs, unexpectedTopK, purpose }) => {
+    if (!hasEmbeddings) return;
+
+    const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+    expectChineseEvalMatch(results, query, purpose, expectedDocs, topK, unexpectedDocs, unexpectedTopK);
   }, 60000);
 });
 
@@ -402,6 +514,11 @@ describe.skipIf(!!process.env.CI)("Hybrid Search (RRF)", () => {
     }
     const threshold = hasVectors ? 0.6 : 0.4;
     expect(hits / standardQueries.length).toBeGreaterThanOrEqual(threshold);
+  }, 60000);
+
+  test.each(chineseEvalQueries)("Chinese Hybrid: $query", async ({ query, expectedDocs, topK, unexpectedDocs, unexpectedTopK, purpose }) => {
+    const results = await hybridSearch(query);
+    expectChineseEvalMatch(results, query, purpose, expectedDocs, topK, unexpectedDocs, unexpectedTopK);
   }, 60000);
 });
 
