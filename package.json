@@ -39,11 +39,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tobi/qmd.git"
+    "url": "git+https://github.com/NathanIceSea/qmd-simple.git"
   },
-  "homepage": "https://github.com/tobi/qmd#readme",
+  "homepage": "https://github.com/NathanIceSea/qmd-simple#readme",
   "bugs": {
-    "url": "https://github.com/tobi/qmd/issues"
+    "url": "https://github.com/NathanIceSea/qmd-simple/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
