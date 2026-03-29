@@ -718,6 +718,8 @@ function ensureDocumentsFtsSchema(db: Database): void {
   const usesConfiguredTokenizer = !!row?.sql
     && new RegExp(`tokenize\\s*=\\s*'${DOCUMENTS_FTS_TOKENIZER.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}'`).test(row.sql);
   if (!usesConfiguredTokenizer) {
+    const reason = row?.sql ? "existing table used a different tokenizer" : "table is missing";
+    console.warn(`Rebuilding FTS index with tokenizer '${DOCUMENTS_FTS_TOKENIZER}' (${reason}). This may take a moment...`);
     rebuildDocumentsFts(db);
     return;
   }
@@ -2570,6 +2572,7 @@ export function sanitizeFTS5Term(term: string): string | null {
 }
 
 export function compileJiebaTerm(db: Database, term: string): string | null {
+  ensureJiebaInitialized(db);
   const row = db.prepare(`SELECT jieba_query(?) AS query`).get(term) as { query?: string | null } | null;
   const compiled = row?.query?.trim();
   return compiled ? `(${compiled})` : null;
