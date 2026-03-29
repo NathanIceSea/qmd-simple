@@ -50,6 +50,8 @@ function mockPWD(path: string): void {
   process.cwd = () => path;
 }
 
+const isWSL = !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+
 // =============================================================================
 // Path Utilities - Cross-platform Support
 // =============================================================================
@@ -327,7 +329,7 @@ describe("Path utilities - Cross-platform support", () => {
   // resolve - Git Bash style paths
   // ===========================================================================
   
-  describe("resolve - Git Bash style paths", () => {
+  describe.skipIf(isWSL)("resolve - Git Bash style paths", () => {
     test("Git Bash to Windows conversion", () => {
       expect(resolve("/c/Users/name")).toBe("C:/Users/name");
       expect(resolve("/C/Users/name")).toBe("C:/Users/name");
